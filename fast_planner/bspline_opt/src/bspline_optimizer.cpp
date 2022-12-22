@@ -24,7 +24,10 @@
 
 
 #include "bspline_opt/bspline_optimizer.h"
+
 #include <nlopt.hpp>
+#include <utils_thread.h>
+
 // using namespace std;
 
 namespace fast_planner {
@@ -115,14 +118,15 @@ Eigen::MatrixXd BsplineOptimizer::BsplineOptimizeTraj(const Eigen::MatrixXd& poi
                                                       int max_time_id) {
   setControlPoints(points);
   setBsplineInterval(ts);
-  setCostFunction(cost_function);
+  setCostFunction(cost_function);  // 注册的成本函数
   setTerminateCond(max_num_id, max_time_id);
 
   optimize();
   return this->control_points_;
 }
 
-void BsplineOptimizer::optimize() {
+void BsplineOptimizer::optimize() 
+{
   /* initialize solver */
   iter_num_        = 0;
   min_cost_        = std::numeric_limits<double>::max();
@@ -147,7 +151,7 @@ void BsplineOptimizer::optimize() {
 
   /* do optimization using NLopt slover */
   nlopt::opt opt(nlopt::algorithm(isQuadratic() ? algorithm1_ : algorithm2_), variable_num_);
-  opt.set_min_objective(BsplineOptimizer::costFunction, this);
+  opt.set_min_objective(BsplineOptimizer::costFunction, this);   
   opt.set_maxeval(max_iteration_num_[max_num_id_]);
   opt.set_maxtime(max_iteration_time_[max_time_id_]);
   opt.set_xtol_rel(1e-5);
@@ -378,7 +382,6 @@ void BsplineOptimizer::combineCost(const std::vector<double>& x, std::vector<dou
 
   if (!(cost_function_ & ENDPOINT)) {
     for (int i = 0; i < order_; i++) {
-
       for (int j = 0; j < dim_; ++j) {
         g_q_[order_ + variable_num_ / dim_ + i][j] =
             control_points_(control_points_.rows() - order_ + i, j);
@@ -391,48 +394,109 @@ void BsplineOptimizer::combineCost(const std::vector<double>& x, std::vector<dou
 
   f_combine = 0.0;
   grad.resize(variable_num_);
-  fill(grad.begin(), grad.end(), 0.0);
+  std::fill(grad.begin(), grad.end(), 0.0);
 
   /*  evaluate costs and their gradient  */
   double f_smoothness, f_distance, f_feasibility, f_endpoint, f_guide, f_waypoints;
   f_smoothness = f_distance = f_feasibility = f_endpoint = f_guide = f_waypoints = 0.0;
 
+ auto f1 = UtilsThread::GetInstance().AddWork([this, &f_smoothness, &f_combine, &grad]()->std::pair<double, std::vector<double>> {  
   if (cost_function_ & SMOOTHNESS) {
     calcSmoothnessCost(g_q_, f_smoothness, g_smoothness_);
     f_combine += lambda1_ * f_smoothness;
-    for (int i = 0; i < variable_num_ / dim_; i++)
-      for (int j = 0; j < dim_; j++) grad[dim_ * i + j] += lambda1_ * g_smoothness_[i + order_](j);
+    for (int i = 0; i < variable_num_ / dim_; ++i) {
+      for (int j = 0; j < dim_; ++j) { 
+        grad[dim_ * i + j] += lambda1_ * g_smoothness_[i + order_](j);
+      }
+    }
+    //return std::make_pair(f_combine, grad);
   }
+  });
+ // f_combine += f1.get().first;
+
+/*
+  if (cost_function_ & SMOOTHNESS) {
+    calcSmoothnessCost(g_q_, f_smoothness, g_smoothness_);
+    f_combine += lambda1_ * f_smoothness;
+    for (int i = 0; i < variable_num_ / dim_; i++) {
+      for (int j = 0; j < dim_; j++) { 
+        grad[dim_ * i + j] += lambda1_ * g_smoothness_[i + order_](j);
+      }
+    }
+  }
+  */
+
+auto f2  = UtilsThread::GetInstance().AddWork([this, &f_distance, &f_combine, &grad]() {  
   if (cost_function_ & DISTANCE) {
     calcDistanceCost(g_q_, f_distance, g_distance_);
     f_combine += lambda2_ * f_distance;
-    for (int i = 0; i < variable_num_ / dim_; i++)
-      for (int j = 0; j < dim_; j++) grad[dim_ * i + j] += lambda2_ * g_distance_[i + order_](j);
+    for (int i = 0; i < variable_num_ / dim_; i++) {
+      for (int j = 0; j < dim_; j++) {
+        grad[dim_ * i + j] += lambda2_ * g_distance_[i + order_](j);
+      }
+    }
+   // return std::make_pair(combine, gradLocal_);
   }
+  });
+
+auto f3 = UtilsThread::GetInstance().AddWork([this, &f_feasibility, &f_combine, &grad] () { 
   if (cost_function_ & FEASIBILITY) {
     calcFeasibilityCost(g_q_, f_feasibility, g_feasibility_);
     f_combine += lambda3_ * f_feasibility;
-    for (int i = 0; i < variable_num_ / dim_; i++)
-      for (int j = 0; j < dim_; j++) grad[dim_ * i + j] += lambda3_ * g_feasibility_[i + order_](j);
+    for (int i = 0; i < variable_num_ / dim_; i++) { 
+      for (int j = 0; j < dim_; j++) {
+        grad[dim_ * i + j] += lambda3_ * g_feasibility_[i + order_](j);
+      }
+   }
   }
+  //return std::make_pair(combine, gradLocal_);
+  });
+
+auto f4 = UtilsThread::GetInstance().AddWork([this, &f_endpoint, &f_combine, &grad]() {  
   if (cost_function_ & ENDPOINT) {
     calcEndpointCost(g_q_, f_endpoint, g_endpoint_);
     f_combine += lambda4_ * f_endpoint;
-    for (int i = 0; i < variable_num_ / dim_; i++)
-      for (int j = 0; j < dim_; j++) grad[dim_ * i + j] += lambda4_ * g_endpoint_[i + order_](j);
+    for (int i = 0; i < variable_num_ / dim_; i++) { 
+      for (int j = 0; j < dim_; j++) {
+        grad[dim_ * i + j] += lambda4_ * g_endpoint_[i + order_](j);
+      }
   }
+}
+  //return std::make_pair(combine, gradLocal_);
+  });
+
+ auto f5 = UtilsThread::GetInstance().AddWork([this, &f_guide, &f_combine, &grad]() {  
   if (cost_function_ & GUIDE) {
     calcGuideCost(g_q_, f_guide, g_guide_);
     f_combine += lambda5_ * f_guide;
-    for (int i = 0; i < variable_num_ / dim_; i++)
-      for (int j = 0; j < dim_; j++) grad[dim_ * i + j] += lambda5_ * g_guide_[i + order_](j);
+    for (int i = 0; i < variable_num_ / dim_; i++) { 
+      for (int j = 0; j < dim_; j++) {
+        grad[dim_ * i + j] += lambda5_ * g_guide_[i + order_](j);
+      }
+    }
   }
+  //return std::make_pair(combine, gradLocal_);
+  });
+
+ auto f6 = UtilsThread::GetInstance().AddWork([this, &f_waypoints, &f_combine, &grad]() {  
   if (cost_function_ & WAYPOINTS) {
     calcWaypointsCost(g_q_, f_waypoints, g_waypoints_);
     f_combine += lambda7_ * f_waypoints;
-    for (int i = 0; i < variable_num_ / dim_; i++)
-      for (int j = 0; j < dim_; j++) grad[dim_ * i + j] += lambda7_ * g_waypoints_[i + order_](j);
+    for (int i = 0; i < variable_num_ / dim_; i++) { 
+      for (int j = 0; j < dim_; j++) {
+        grad[dim_ * i + j] += lambda7_ * g_waypoints_[i + order_](j);
+      }
+    }
   }
+  //return std::make_pair(combine, grad);
+  });
+  
+  f1.wait();
+  f2.wait();
+  f3.wait();
+  f4.wait();
+  f5.wait();
+  f6.wait();
   /*  print cost  */
   // if ((cost_function_ & WAYPOINTS) && iter_num_ % 10 == 0) {
   //   cout << iter_num_ << ", total: " << f_combine << ", acc: " << lambda8_ * f_view
@@ -449,9 +513,10 @@ void BsplineOptimizer::combineCost(const std::vector<double>& x, std::vector<dou
 }
 
 double BsplineOptimizer::costFunction(const std::vector<double>& x, std::vector<double>& grad,
-                                      void* func_data) {
+                                      void* func_data) 
+{
   BsplineOptimizer* opt = reinterpret_cast<BsplineOptimizer*>(func_data);
-  double            cost;
+  double            cost = 0;
   opt->combineCost(x, grad, cost);
   opt->iter_num_++;
 
